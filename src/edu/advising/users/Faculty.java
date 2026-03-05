@@ -1,15 +1,17 @@
 package edu.advising.users;
 
-import edu.advising.core.Column;
-import edu.advising.core.Id;
-import edu.advising.core.Table;
+import edu.advising.commands.Enrollment;
+import edu.advising.commands.Section;
+import edu.advising.core.*;
 
+import java.sql.SQLException;
 import java.time.LocalDate;
+import java.util.List;
 
 /**
  * Faculty - Concrete user type
  */
-@Table(name = "faculty")
+@Table(name = "faculty", isSubTable = true)
 public class Faculty extends User {
     @Id
     @Column(name="employee_id")
@@ -24,6 +26,9 @@ public class Faculty extends User {
     private String officeHours;
     @Column(name="hire_date")
     private LocalDate hireDate;
+
+    @OneToMany(targetEntity = Section.class, mappedBy = "faculty_id")
+    private List<Section> sections;
 
     public Faculty() {}
 
@@ -96,5 +101,26 @@ public class Faculty extends User {
 
     public void setHireDate(LocalDate hireDate) {
         this.hireDate = hireDate;
+    }
+
+    public List<Section> getSections() throws SQLException {
+        if (this.sections == null) {
+            // Lazy Load: Use the generic fetchMany from DatabaseManager
+            this.sections = DatabaseManager.getInstance()
+                    .fetchMany(Section.class, "faculty_id", this.id);
+        }
+        return this.sections;
+    }
+
+    public void setSections(List<Section> sections) throws SQLException, IllegalAccessException{
+        if(this.getId() == 0) {
+            // We need to save this object to get an id to set on the list items.
+            DatabaseManager.getInstance().upsert(this);
+        }
+        // Now, let's add this object's id to the related list items foreign key id
+        for(Section s : sections) { s.setFacultyId(this.getId()); }
+        // Now let's upsertAll of these list items (i.e. a batch) and set as this object's related field.
+        DatabaseManager.getInstance().upsertAll(sections);
+        this.sections = sections;
     }
 }

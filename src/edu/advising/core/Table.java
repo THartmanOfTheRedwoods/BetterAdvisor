@@ -7,4 +7,7 @@ import java.lang.annotation.ElementType;
 
 @Retention(RetentionPolicy.RUNTIME)
 @Target(ElementType.TYPE)
-public @interface Table { String name(); }
+public @interface Table {
+    String name();
+    boolean isSubTable() default false;
+}

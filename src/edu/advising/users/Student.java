@@ -1,6 +1,7 @@
 package edu.advising.users;
 
 import edu.advising.commands.Section;
+import edu.advising.commands.WaitlistEntry;
 import edu.advising.core.*;
 
 import java.math.BigDecimal;
@@ -12,26 +13,25 @@ import java.util.List;
  * -
  * Student - Concrete user type
  */
-@Table(name = "students")
+@Table(name = "students", isSubTable = true)
 public class Student extends User {
     @Id
     @Column(name = "student_id")
-    private String studentId;
+    protected String studentId;
     @Column(name = "gpa")
-    private BigDecimal gpa;
+    protected BigDecimal gpa;
     @Column(name = "enrollment_status")
-    private String enrollmentStatus;
+    protected String enrollmentStatus;
     @Column(name = "academic_standing")
-    private String academicStanding;
+    protected String academicStanding;
     @Column(name = "classification")
-    private String classification;
+    protected String classification;
     @Column(name = "major")
-    private String major;
+    protected String major;
     @Column(name = "minor")
-    private String minor;
+    protected String minor;
     @Column(name = "advisor_id")
-    private int advisorId;
-
+    protected int advisorId;
     @ManyToMany(
             targetEntity = Section.class,
             joinTable = "enrollments",
@@ -39,6 +39,8 @@ public class Student extends User {
             inverseJoinColumn = "section_id" // Linking table's FK for Section table's PK
     )
     private List<Section> sections;
+    @OneToMany(targetEntity = WaitlistEntry.class, mappedBy = "student_id")
+    private List<WaitlistEntry> waitlist;
 
     public Student() {}
 
@@ -62,6 +64,13 @@ public class Student extends User {
         System.out.println("- Check Grades");
         System.out.println("- Financial Aid");
         System.out.println("- Make Payment");
+    }
+
+    protected void ensureId() throws SQLException, IllegalAccessException {
+        if(this.getId() == 0) {
+            // If the id is not set, we need to save this object to get an id to set on the list items.
+            DatabaseManager.getInstance().upsert(this);
+        }
     }
 
     // Getters and setters
@@ -139,5 +148,25 @@ public class Student extends User {
 
     public void setSections(List<Section> sections) {
         this.sections = sections;
+    }
+
+    public List<WaitlistEntry> getWaitlist() throws SQLException {
+        // TODO: Gotta find a way to modify the fetch calls to take additional filters since this will return
+        //   WaitlistEntries of ANY age and in ANY status.
+        if (this.waitlist == null) {
+            // Lazy Load: Use the generic fetchMany from DatabaseManager
+            this.waitlist = DatabaseManager.getInstance()
+                    .fetchMany(WaitlistEntry.class, "student_id", this.id);
+        }
+        return this.waitlist;
+    }
+
+    public void setWaitlist(List<WaitlistEntry> waitlist) throws SQLException, IllegalAccessException {
+        ensureId();
+        // Now, let's add this object's id to the related list items foreign key id
+        for(WaitlistEntry we : waitlist) { we.setStudentId(this.getId()); }
+        // Now let's upsertAll of these list items (i.e. a batch) and set as this object's related field.
+        DatabaseManager.getInstance().upsertAll(waitlist);
+        this.waitlist = waitlist;
     }
 }

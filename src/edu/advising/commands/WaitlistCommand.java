@@ -1,31 +1,27 @@
 package edu.advising.commands;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import edu.advising.core.DatabaseManager;
-import edu.advising.core.Table;
 import edu.advising.notifications.NotificationManager;
 import edu.advising.notifications.ObservableStudent;
 
 import java.sql.SQLException;
 import java.time.LocalDateTime;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.HashMap;
 import java.util.Map;
 
 /**
- * RegisterCommand - Register student for a course section
+ * WaitlistCommand - Add student to waitlist
  */
-@Table(name = "command_history", isSubTable = true)
-public class RegisterCommand extends BaseCommand {
+public class WaitlistCommand extends BaseCommand {
     private ObservableStudent student;
     private Section section;
+    private int waitlistId;
     private NotificationManager notificationManager;
-    private int enrollmentId;
 
-    public RegisterCommand(ObservableStudent student, Section section) {
+    public WaitlistCommand(ObservableStudent student, Section section) {
         super();
-        this.commandType = "REGISTER";
         this.student = student;
         this.section = section;
         this.notificationManager = NotificationManager.getInstance();
@@ -35,31 +31,20 @@ public class RegisterCommand extends BaseCommand {
     public void execute() {
         executionTime = LocalDateTime.now();
 
-        if (!section.hasCapacity()) {
-            successful = false;
-            System.out.printf("✗ Registration failed for %s - section full%n", section.getCourseCode());
-            this.setErrorMessage(String.format("✗ Registration failed for %s - section full", section.getCourseCode()));
-            return;
-        }
-
-        // Check for schedule conflicts (simplified)
-        if (hasScheduleConflict()) {  // TODO: Should be a student schedule check
-            successful = false;
-            System.out.printf("✗ Registration failed for %s - schedule conflict%n", section.getCourseCode());
-            this.setErrorMessage(
-                    String.format("✗ Registration failed for %s - schedule conflict", section.getCourseCode()));
-            return;
-        }
-
-        if ((this.enrollmentId = section.enroll(student)) > 0) {
+        if ((this.waitlistId = section.addToWaitlist(student)) > 0) {
             executed = true;
             successful = true;
-            System.out.printf("✓ Student %s registered for %s%n", student.getStudentId(), section.getCourseCode());
+            try {
+                int position = section.getWaitlistPosition(student);
+                System.out.printf("✓ Student %s added to waitlist for %s (Position: #%d)%n",
+                        student.getStudentId(), section.getCourseCode(), position);
+                notificationManager.notifyWaitlistUpdate(student, section.getCourseCode(), position);
+            } catch (SQLException e) {
+                System.out.printf("✓ Student %s added to waitlist for %s but couldn't determine position.%n",
+                        student.getStudentId(), section.getCourseCode());
+                notificationManager.notifyWaitlistUpdate(student, section.getCourseCode(), -1);
+            }
 
-            // Trigger notification
-            notificationManager.notifyRegistration(student, section.getCourseCode(), true);
-        } else {
-            successful = false;
         }
     }
 
@@ -70,13 +55,12 @@ public class RegisterCommand extends BaseCommand {
             return;
         }
 
-        // Remove from section
-        if( section.drop(student) ) {
-            System.out.printf("↶ Undone: Registration for %s%n", section.getCourseCode());
+        if (section.removeFromWaitlist(student)) {
+            System.out.printf("↶ Undone: Waitlist for %s%n", section.getCourseCode());
             this.undoneAt = LocalDateTime.now();
             this.isUndone = true;
-            // Notify about drop
-            notificationManager.notifyRegistration(student, section.getCourseCode(), false);
+            // Notify about waitlist removal.
+            notificationManager.notifyWaitlistUpdate(student, section.getCourseCode(), Integer.MAX_VALUE);
         }
     }
 
@@ -87,12 +71,7 @@ public class RegisterCommand extends BaseCommand {
 
     @Override
     public String getDescription() {
-        return String.format("Register for %s (%s)", section.getCourseCode(), section.getCourseName());
-    }
-
-    private boolean hasScheduleConflict() {
-        // Simplified - in real implementation, check time conflicts in student.
-        return false;
+        return String.format("Add to waitlist for %s", section.getCourseCode());
     }
 
     @Override
@@ -101,7 +80,7 @@ public class RegisterCommand extends BaseCommand {
         Map<String, Object> data = new HashMap<>();
         data.put("studentId", student.getStudentId());
         data.put("sectionId", section.getId()); // Assuming Section has an id
-        data.put("enrollmentId", enrollmentId);
+        data.put("waitlistId", waitlistId);
         try {
             return mapper.writeValueAsString(data);
         } catch (JsonProcessingException e) {
@@ -119,10 +98,9 @@ public class RegisterCommand extends BaseCommand {
                     .fetchOne(ObservableStudent.class, "id", data.get("studentId"));
             this.section = DatabaseManager.getInstance()
                     .fetchOne(Section.class, "id", data.get("sectionId"));
-            this.enrollmentId = (int)data.get("enrollmentId");
+            this.waitlistId = (int) data.get("waitlistId");
         } catch (JsonProcessingException | SQLException e) {
             throw new RuntimeException("Failed to deserialize RegisterCommand data", e);
         }
     }
 }
-

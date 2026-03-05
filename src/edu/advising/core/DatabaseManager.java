@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.lang.reflect.Field;
+import java.util.Optional;
 
 // TODO: Make DatabaseManager an abstract class that implements a template methods for methods like upsertAll, which use
 //  an abstract method called buildUpsertSql to implement Database specific upsert sql statements, then implement
@@ -104,9 +105,25 @@ public class DatabaseManager {
     }
 
     /**
+     * NOTE: ADD Command Week
+     * -
+     * Get class inheritance hierarchy for a class.
+     */
+    private List<Class<?>> getTableHierarchy(Class<?> clazz) {
+        List<Class<?>> hierarchy = new ArrayList<>();
+        while (clazz != null && clazz.isAnnotationPresent(Table.class)) {
+            hierarchy.add(0, clazz); // Add to the front to get [User, Student]
+            clazz = clazz.getSuperclass();
+        }
+        return hierarchy;
+    }
+
+    /**
      * NOTE: ADD Observer Week
      * -
-     * Get all annotated fields.
+     * Get annotated fields Local to the clazz.
+     *
+     * @param clazz The class to inspect for annotated fields.
      */
     private List<Field> getAnnotatedFields(Class<?> clazz) {
         List<Field> columns = new ArrayList<>();
@@ -120,20 +137,21 @@ public class DatabaseManager {
     /**
      * NOTE: ADD Command Week
      * -
-     * Recursively get all annotated fields, even those inherited from Superclass!
+     * Recursively get All annotated fields, even those inherited from Superclass(es)!
      * This is to support Superclass/Subclass hierarchies like User -> Student or User -> Faculty.
+     *
+     * @param clazz The class to inspect for annotated fields.
      */
     private List<Field> getAllAnnotatedFields(Class<?> clazz) {
         List<Field> fields = new ArrayList<>();
-        // Recursively climb the inheritance tree
-        while (clazz != null && clazz != Object.class) {
-            for (Field field : clazz.getDeclaredFields()) {
+        List<Class<?>> hierarchy = getTableHierarchy(clazz);
+        for (Class<?> c : hierarchy) {
+            for (Field field : c.getDeclaredFields()) {
                 field.setAccessible(true);
                 if (field.isAnnotationPresent(Column.class)) {
                     fields.add(field);
                 }
             }
-            clazz = clazz.getSuperclass(); // Move up to User.class
         }
         return fields;
     }
@@ -163,10 +181,9 @@ public class DatabaseManager {
     /**
      * NOTE: ADD Observer or Command Week
      * -
-     * Gets the PRIMARY annotated @Id field of a Class recursively to handle hierarchical classes.
+     * Gets the PRIMARY annotated @Id field's name of a Class recursively to handle hierarchical classes.
      */
     private <T> String getPrimaryIdColumnName(Class<T> targetClass) {
-        // We get the target ID column name from the @Id field of the target class
         return getAllAnnotatedFields(targetClass).stream()
                 .filter(f -> f.isAnnotationPresent(Id.class))
                 .filter(f -> f.getAnnotation(Id.class).isPrimary())
@@ -175,19 +192,76 @@ public class DatabaseManager {
     }
 
     /**
+     * NOTE: ADD Command Week
+     * -
+     * Gets the PRIMARY annotated @Id field of a Class recursively to handle hierarchical classes.
+     */
+    private <T> Optional<Field> getPrimaryIdColumn(Class<T> targetClass) {
+        // We get the target ID column name from the @Id field of the target class
+        return getAllAnnotatedFields(targetClass).stream()
+                .filter(f -> f.isAnnotationPresent(Id.class))
+                .filter(f -> f.getAnnotation(Id.class).isPrimary())
+                .findFirst();
+    }
+
+
+    /**
      * NOTE: ADD Observer Week
      * -
      * Only get fields that aren't ignored for upserts. We ignore AUTO_INCREMENT id fields, for example.
      * To ignore AUTO_INC fields though, you'll still need a UNIQUE index on the Natural Key for upsert to work.
      */
-    private List<Field> getUpsertFields(List<Field> allFields) {
+    private List<Field> getUpsertFields(List<Field> allFields, Class<?> clazz) {
         List<Field> upsertFields = new ArrayList<>();
         for (Field f : allFields) {
             Column col = f.getAnnotation(Column.class);
             boolean isIgnored = col.upsertIgnore();
-            if (!isIgnored) { upsertFields.add(f); }
+            if (!isIgnored) {
+                upsertFields.add(f);
+            }
+        }
+        // Need to make sure the parent's primary Id is in this list if this is a sub-class.
+        if (clazz.getAnnotation(Table.class).isSubTable()) {
+            Optional<Field> oFieldPId = getPrimaryIdColumn(clazz);
+            oFieldPId.ifPresent(upsertFields::add);
         }
         return upsertFields;
+    }
+
+    /**
+     * NOTE: ADD Observer Week
+     * -
+     * Propagate's Parent Ids/Primary keys to Subclass objects during hierarchical/related table updates.
+     * This allows tables like Student to get its id from the related Superclass/User INSERT/UPDATE.
+     * SQLException can arise due to database queries
+     * IllegalAccessException can arise due to java.lang.reflect when using annotations.
+     */
+    private <T> void propagateGeneratedKeys(PreparedStatement pstmt, List<T> items, List<Field> localFields)
+            throws SQLException, IllegalAccessException {
+        // Find the auto-increment field in this class level
+        // NOTE: localFields for say User will find an autoIncField and pass on to Student Items,
+        //   but Student localFields will not, and therefore not go into the isPresent conditional.
+        //   Thus, this only works for 2 levels, which is liekly good enough.
+        Optional<Field> autoIncField = localFields.stream()
+                .filter(f -> f.getAnnotation(Column.class).upsertIgnore())
+                .findFirst();
+
+        if (autoIncField.isPresent()) {
+            Field field = autoIncField.get();
+            field.setAccessible(true);
+
+            try (ResultSet rs = pstmt.getGeneratedKeys()) {
+                for (T item : items) {
+                    // If the object didn't have an ID, set the one the DB just made
+                    Object existingId = field.get(item);
+                    if (existingId == null || (existingId instanceof Number && ((Number) existingId).longValue() == 0)) {
+                        if (rs.next()) {
+                            field.set(item, rs.getObject(1));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -201,23 +275,62 @@ public class DatabaseManager {
     public <T> void upsertAll(List<T> items) throws SQLException, IllegalAccessException {
         if (items == null || items.isEmpty()) return;
 
-        Class<?> clazz = items.get(0).getClass();
-        Table tableAnn = clazz.getAnnotation(Table.class);
-        List<Field> allFields = getAnnotatedFields(clazz);
-        List<Field> columns = getUpsertFields(allFields);
-        List<Field> keyColumns = getIdAnnotatedFields(columns);
+        Connection conn = dataSource.getConnection();
+        try {
+            conn.setAutoCommit(false); // Start Transaction
 
-        String sql = buildUpsertSql(tableAnn.name(), columns, keyColumns);
+            Class<?> leafClass = items.get(0).getClass();
+            List<Class<?>> hierarchy = getTableHierarchy(leafClass);
 
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            for (T item : items) {
-                for (int i = 0; i < columns.size(); i++) {
-                    pstmt.setObject(i + 1, columns.get(i).get(item));
+            for (Class<?> clazz : hierarchy) {
+                Table tableAnn = clazz.getAnnotation(Table.class);
+
+                // Only get fields DECLARED in this specific class (User fields vs Student fields)
+                List<Field> localFields = getAnnotatedFields(clazz);
+
+                // If this subclass has no localFields, we can safely ignore it.
+                if (localFields.isEmpty()) {
+                    continue;
                 }
-                pstmt.addBatch();
+
+                // Handle ID Generation/Exclusion logic
+                //List<Field> writeableFields = determineWriteableFields(items.get(0), localFields);
+                List<Field> writeableFields = getUpsertFields(localFields, clazz);
+
+                // List<Field> keyFields = localFields.stream().filter(f -> f.isAnnotationPresent(Id.class)).toList();
+                List<Field> keyFields = getIdAnnotatedFields(writeableFields);
+
+                String sql = buildUpsertSql(tableAnn.name(), writeableFields, keyFields);
+
+                try (PreparedStatement pstmt = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+                    for (T item : items) {
+                        for (int i = 0; i < writeableFields.size(); i++) {
+                            Field f = writeableFields.get(i);
+                            Object value = f.get(item);
+
+                            if (f.getAnnotation(Column.class).nullableforeignKey() && (value == null || (int) value == 0)) {
+                                pstmt.setObject(i + 1, null); // Make sure we send a null FK
+                            } else {
+                                pstmt.setObject(i + 1, value);
+                            }
+                        }
+                        pstmt.addBatch();
+                    }
+                    //System.out.printf("~~~~%n%s%n~~~~%n", pstmt.toString());
+                    pstmt.executeBatch();
+
+                    // ID HAND-OFF: If this was the parent table and IDs were generated,
+                    // we must catch them and set them on the items for the next table (FK)
+                    propagateGeneratedKeys(pstmt, items, localFields);
+                }
             }
-            pstmt.executeBatch();
+            conn.commit(); // Success!
+        } catch (Exception e) {
+            conn.rollback(); // Undo everything on failure
+            throw new SQLException("Transaction failed. Changes rolled back.", e);
+        } finally {
+            conn.setAutoCommit(true);
+            conn.close();
         }
     }
 
@@ -228,7 +341,7 @@ public class DatabaseManager {
 
         // 1. Build Column list and Value placeholders
         for (int i = 0; i < allColumns.size(); i++) {
-            sql.append(allColumns.get(i).getAnnotation(Column.class).name());
+            sql.append(String.format("`%s`", allColumns.get(i).getAnnotation(Column.class).name()));
             values.append("?");
             if (i < allColumns.size() - 1) {
                 sql.append(", ");
@@ -238,7 +351,7 @@ public class DatabaseManager {
 
         // 2. Build the KEY clause (The columns to match on)
         for (int i = 0; i < keyColumns.size(); i++) {
-            keys.append(keyColumns.get(i).getAnnotation(Column.class).name());
+            keys.append(String.format("`%s`", keyColumns.get(i).getAnnotation(Column.class).name()));
             if (i < keyColumns.size() - 1) keys.append(", ");
         }
 
@@ -251,28 +364,25 @@ public class DatabaseManager {
      * Example: "students t JOIN users p ON t.id = p.id"
      */
     protected String buildJoinedFromClause(Class<?> clazz) {
-        Table tableAnn = clazz.getAnnotation(Table.class);
-        String alias = "t";
-        StringBuilder from = new StringBuilder(tableAnn.name() + " " + alias);
-
-        Class<?> current = clazz;
-        int parentCount = 1;
-
-        while (current.getSuperclass() != null && current.getSuperclass().isAnnotationPresent(Table.class)) {
-            Class<?> parent = current.getSuperclass();
+        Table tableAnn = clazz.getAnnotation(Table.class);  // Child table
+        String alias = "t"; // Child alias
+        StringBuilder from = new StringBuilder(tableAnn.name() + " " + alias); // Initial SQL
+        String childId = getPrimaryIdColumnName(clazz); // Initial primary id for joining.
+        // Get the full hierarchy.
+        List<Class<?>> hierarchy = getTableHierarchy(clazz);
+        // Pseudo windowing function to consider 2 table hierarchies at a time, pseudo cause we ignore the Child table.
+        for (int i = hierarchy.size() - 2; i >= 0; i--) {  // Minus 2 to ignore child, which is last in hierarchy.
+            Class<?> parent = hierarchy.get(i);
             String parentTable = parent.getAnnotation(Table.class).name();
-            String parentAlias = "p" + parentCount;
-
-            // Find Primary ID columns for joining
-            String childId = getPrimaryIdColumnName(current);
+            String parentAlias = "p" + i;
+            // Find Primary ID column for joining
             String parentId = getPrimaryIdColumnName(parent);
-
+            // Process the pair (current, next)
             from.append(String.format(" JOIN %s %s ON %s.%s = %s.%s",
                     parentTable, parentAlias, alias, childId, parentAlias, parentId));
-
-            current = parent;
+            // Update alias and childId so the next join uses previous parent as the new child.
             alias = parentAlias;
-            parentCount++;
+            childId = parentId;
         }
         return from.toString();
     }
@@ -310,14 +420,14 @@ public class DatabaseManager {
                             // If other cases arise, consider redesigning and refactoring, perhaps with a HashMap.
                             if (value instanceof Timestamp) {
                                 field.set(dto, ((Timestamp) value).toLocalDateTime());  // This assumes LocalDateTime
-                            } else if(value instanceof Date) {
+                            } else if (value instanceof Date) {
                                 field.set(dto, ((Date) value).toLocalDate());  // This assumes LocalDate
                             } else {
                                 field.set(dto, value);
                             }
                         }
                     } catch (SQLException e) {
-                        System.out.printf("Skipped %s as its not in SQL Result%n", colName);
+                        System.out.printf("~~~ Skipped %s as its not in SQL Result ~~~%n", colName);
                     }
                 }
                 return dto;
@@ -358,40 +468,14 @@ public class DatabaseManager {
      * Fetches a list of related objects across a Many-to-Many join table.
      * TODO: Modify fetchManyToMany to take Optional Filter parameter allowing for additional SQL Filters.
      */
-    /*
     public <T> List<T> fetchManyToMany(Class<T> targetClass, String joinTable,
                                        String joinCol, String invJoinCol, Object sourceId) throws SQLException {
-
         String targetTable = targetClass.getAnnotation(Table.class).name();
-        String targetIdCol = getLocalIdColumnName(targetClass);
-
-        // Example: SELECT s.* FROM sections s JOIN enrollments e ON s.section_id = e.section_id WHERE e.student_id = ?
-        String sql = String.format(
-                "SELECT t.* FROM %s t JOIN %s j ON t.%s = j.%s WHERE j.%s = ?",
-                targetTable, joinTable, targetIdCol, invJoinCol, joinCol
-        );
-
-        return fetchList(sql, autoMapper(targetClass), sourceId);
-    }
-    */
-    public <T> List<T> fetchManyToMany(Class<T> targetClass, String joinTable,
-                                       String joinCol, String invJoinCol, Object sourceId) throws SQLException {
-
-        String targetTable = targetClass.getAnnotation(Table.class).name();
-        //String targetIdCol = getLocalIdColumnName(targetClass);
         String targetIdCol = getPrimaryIdColumnName(targetClass);
-
-        String fromClause = targetTable + " t";
 
         // INHERITANCE CHECK to handle Model Inheritance hierarchies.
         // If the parent has a @Table, we must JOIN it to handle cases like: User -> Student or User -> Faculty
-        Class<?> parent = targetClass.getSuperclass();
-        if (parent != null && parent.isAnnotationPresent(Table.class)) {
-            String parentTable = parent.getAnnotation(Table.class).name();
-            String parentIdCol = getLocalIdColumnName(parent);
-            // We join the target table to the parent table on their shared ID (NOTE: MUST be shared)
-            fromClause += String.format(" JOIN %s p ON t.%s = p.%s", parentTable, targetIdCol, parentIdCol);
-        }
+        String fromClause = buildJoinedFromClause(targetClass);
 
         // Example: SELECT s.* FROM sections s JOIN enrollments e ON s.section_id = e.section_id WHERE e.student_id = ?
         String sql = String.format(
@@ -400,6 +484,73 @@ public class DatabaseManager {
         );
 
         return fetchList(sql, autoMapper(targetClass), sourceId);
+    }
+
+    /**
+     * Deletes a single object from the database.
+     * Reuses the deleteAll logic to ensure hierarchical integrity.
+     */
+    public <T> void delete(T item) throws SQLException, IllegalAccessException {
+        if (item == null) return;
+        deleteAll(Collections.singletonList(item));
+    }
+
+    /**
+     * Deletes a list of objects from the database.
+     * Handles class hierarchies by deleting from the most specific table (child)
+     * up to the most general table (parent).
+     */
+    public <T> void deleteAll(List<T> items) throws SQLException, IllegalAccessException {
+        if (items == null || items.isEmpty()) return;
+
+        Connection conn = dataSource.getConnection();
+        try {
+            conn.setAutoCommit(false); // Start Transaction
+
+            Class<?> leafClass = items.get(0).getClass();
+            List<Class<?>> hierarchy = getTableHierarchy(leafClass);
+
+            // IMPORTANT: We must delete in REVERSE order of insertion.
+            // If hierarchy is [User, Student], we must delete from Student then User.
+            List<Class<?>> reverseHierarchy = new ArrayList<>(hierarchy);
+            Collections.reverse(reverseHierarchy);
+
+            for (Class<?> clazz : reverseHierarchy) {
+                Table tableAnn = clazz.getAnnotation(Table.class);
+                if (tableAnn == null) continue;
+
+                // We identify the row to delete using the Primary ID defined in the hierarchy
+                String primaryKeyColName = getPrimaryIdColumnName(leafClass);
+                Optional<Field> oPrimaryField = getPrimaryIdColumn(leafClass);
+
+                if (oPrimaryField.isEmpty()) {
+                    throw new SQLException("Delete failed: No primary key field found for " + leafClass.getSimpleName());
+                }
+
+                Field primaryField = oPrimaryField.get();
+                primaryField.setAccessible(true);
+
+                String sql = String.format("DELETE FROM %s WHERE %s = ?", tableAnn.name(), primaryKeyColName);
+
+                try (PreparedStatement pstmt = conn.prepareStatement(sql)) {
+                    for (T item : items) {
+                        Object idValue = primaryField.get(item);
+                        if (idValue == null) continue; // Cannot delete a record without an ID
+
+                        pstmt.setObject(1, idValue);
+                        pstmt.addBatch();
+                    }
+                    pstmt.executeBatch();
+                }
+            }
+            conn.commit(); // Success!
+        } catch (Exception e) {
+            conn.rollback(); // Undo everything on failure
+            throw new SQLException("Delete transaction failed. Changes rolled back.", e);
+        } finally {
+            conn.setAutoCommit(true);
+            conn.close();
+        }
     }
 
     /**
@@ -459,6 +610,7 @@ public class DatabaseManager {
                     "user_type VARCHAR(20) NOT NULL, " +
                     "first_name VARCHAR(50) NOT NULL, " +
                     "last_name VARCHAR(50) NOT NULL, " +
+                    "phone VARCHAR(20)," +
                     "email VARCHAR(100), " +
                     "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, " +
                     "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, " +
@@ -750,6 +902,22 @@ public class DatabaseManager {
                     "can_access BOOLEAN DEFAULT TRUE, " +
                     "UNIQUE(role_name, feature_code))");
 
+            executeUpdate("CREATE TABLE IF NOT EXISTS permission_grants (" +
+                    "id  INT AUTO_INCREMENT PRIMARY KEY," +
+            "faculty_id  INT NOT NULL," +
+            "student_id  INT NOT NULL," +
+            "section_id  INT NOT NULL," +
+            "granted_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP," +
+            "expires_at  TIMESTAMP NOT NULL," +
+            "is_used     BOOLEAN DEFAULT FALSE," +
+            "used_at     TIMESTAMP," +
+            "is_active   BOOLEAN DEFAULT TRUE," +
+            "notes       TEXT," +
+            "FOREIGN KEY (faculty_id) REFERENCES faculty(id)," +
+            "FOREIGN KEY (student_id) REFERENCES students(id)," +
+            "FOREIGN KEY (section_id) REFERENCES sections(id)," +
+            "UNIQUE (student_id, section_id))");
+
             executeUpdate("CREATE TABLE IF NOT EXISTS restrictions (" +
                     "id INT AUTO_INCREMENT PRIMARY KEY, " +
                     "student_id INT NOT NULL, " +
@@ -962,6 +1130,9 @@ public class DatabaseManager {
             executeUpdate("CREATE INDEX IF NOT EXISTS idx_waitlist_section ON waitlist(section_id)");
             executeUpdate("CREATE INDEX IF NOT EXISTS idx_restrictions_student ON restrictions(student_id)");
             executeUpdate("CREATE INDEX IF NOT EXISTS idx_restrictions_active ON restrictions(is_active)");
+            executeUpdate("CREATE INDEX IF NOT EXISTS idx_perm_grants_student ON permission_grants(student_id)");
+            executeUpdate("CREATE INDEX IF NOT EXISTS idx_perm_grants_section ON permission_grants(section_id)");
+            executeUpdate("CREATE INDEX IF NOT EXISTS idx_perm_grants_active ON permission_grants(is_active)");
 
             System.out.println("✓ Database schema initialized successfully");
             System.out.println("  Total tables created: 40+");

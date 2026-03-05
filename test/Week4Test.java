@@ -89,7 +89,7 @@ public class Week4Test {
         System.out.println("\n--- Restriction Alert ---");
         notificationManager.notifyRestriction(bob, "FINANCIAL_HOLD", "Outstanding balance of $500");
 
-        System.out.println("\n--- Waitlist Update ---");
+        System.out.println("\n--- WaitlistEntry Update ---");
         notificationManager.notifyWaitlistUpdate(angie, "CS301", 3);
 
         System.out.println("\n--- System-wide Broadcast ---");

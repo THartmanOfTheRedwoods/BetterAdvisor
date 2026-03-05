@@ -24,7 +24,7 @@ public class Course {
     private String description;
     @Column(name = "credits")
     private double credits;
-    @Column(name = "department_id")
+    @Column(name = "department_id", foreignKey = true)
     private int departmentId;
     @Column(name = "level")
     private String level;
@@ -32,8 +32,21 @@ public class Course {
     private boolean isActive;
     @OneToMany(targetEntity = Section.class, mappedBy = "course_id")
     private List<Section> sections; // Cached list of available sections.
+    @ManyToOne(targetEntity = Department.class, joinColumn = "department_id")
+    private Department department;
 
     public Course() {}
+
+    public Course(String code, String name, String description, int credits, int departmentId, String level) {
+        this.code = code;
+        this.name = name;
+        this.description = description;
+        this.credits = credits;
+        this.departmentId = departmentId;
+        this.level = level;
+        this.isActive = true;
+
+    }
 
     public int getId() {
         return id;
@@ -108,7 +121,32 @@ public class Course {
         return this.sections;
     }
 
-    public void setSections(List<Section> sections) {
+    protected void ensureId() throws SQLException, IllegalAccessException {
+        if(this.getId() == 0) {
+            // If the id is not set, we need to save this object to get an id to set on the list items.
+            DatabaseManager.getInstance().upsert(this);
+        }
+    }
+
+    public void setSections(List<Section> sections) throws SQLException, IllegalAccessException {
+        ensureId();
+        // Now, let's add this object's id to the related list items foreign key id
+        for(Section s : sections) { s.setCourseId(this.getId()); }
+        // Now let's upsertAll of these list items (i.e. a batch) and set as this object's related field.
+        DatabaseManager.getInstance().upsertAll(sections);
         this.sections = sections;
+    }
+
+    public Department getDepartment() throws SQLException {
+        if (this.department == null) {
+            // Lazy Load: Use the generic fetchOne from DatabaseManager
+            this.department = DatabaseManager.getInstance()
+                    .fetchOne(Department.class, "id", this.departmentId);
+        }
+        return (this.department != null) ? this.department : null;
+    }
+
+    public void setDepartment(Department department) {
+        this.department = department;
     }
 }

@@ -5,7 +5,7 @@ import java.time.LocalDateTime;
 /**
  * Command - Interface for all command objects
  */
-interface Command {
+public interface Command {
     void execute();
     void undo();
     boolean isUndoable();

@@ -153,7 +153,7 @@ public class NotificationManager implements Subject {
     public void notifyWaitlistUpdate(Student student, String courseCode, int position) {
         Notification notification = new Notification(
                 "WAITLIST",
-                String.format("Waitlist update for %s: Position #%d", courseCode, position),
+                String.format("WaitlistEntry update for %s: Position #%d", courseCode, position),
                 student.getId(),
                 "MEDIUM"
         );

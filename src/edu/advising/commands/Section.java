@@ -1,9 +1,9 @@
 package edu.advising.commands;
 
 import edu.advising.core.*;
+import edu.advising.users.Faculty;
 import edu.advising.users.Student;
 
-import javax.xml.crypto.Data;
 import java.sql.SQLException;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -19,7 +19,7 @@ public class Section {
     @Column(name = "id", upsertIgnore = true)
     private int id;
     @Id
-    @Column(name = "course_id")
+    @Column(name = "course_id", foreignKey = true)
     private int courseId;  // References courses
     @Id
     @Column(name = "section_number")
@@ -34,7 +34,7 @@ public class Section {
     private int capacity;
     @Column(name = "enrolled")
     private int enrolled;
-    @Column(name = "faculty_id")
+    @Column(name = "faculty_id", nullableforeignKey = true)
     private int facultyId; // References faculty
     @Column(name = "room")
     private String room;
@@ -42,6 +42,8 @@ public class Section {
     private String status;  //OPEN, CLOSED, CANCELLED
     @ManyToOne(targetEntity = Course.class, joinColumn = "course_id")
     private Course course; // Cached object representing this sections courses.
+    @ManyToOne(targetEntity = Faculty.class, joinColumn = "faculty_id")
+    private Faculty faculty; // Cached object representing this faculty that teaches this course.
     @ManyToMany(
             targetEntity = Student.class,
             joinTable = "enrollments",
@@ -51,90 +53,104 @@ public class Section {
     private List<Student> enrolledStudents;
     @OneToMany(targetEntity = Enrollment.class, mappedBy = "section_id")
     private List<Enrollment> enrollments;
-
-    // TODO: Figure out lazy loading of linked data-structures like waitlist and faculty
-    private List<Integer> waitlist;
+    @OneToMany(targetEntity = WaitlistEntry.class, mappedBy = "section_id")
+    private List<WaitlistEntry> waitlist;
 
     public Section() {}
 
     public Section(int id, int courseId, String sectionNumber,
                    String semester, int year, int capacity, int enrolled, int facultyId, String room, String status) {
-        this.id = id;
-        this.courseId = courseId;
-        this.sectionNumber = sectionNumber;
-        this.semester = semester;
-        this.year = year;
-        this.capacity = capacity;
-        this.enrolled = enrolled;
-        this.facultyId = facultyId;
+        this(id, courseId, sectionNumber, semester, year, capacity, enrolled, facultyId);
         this.room = room;
         this.status = status;
-        this.enrolledStudents = new ArrayList<>();
-        this.waitlist = new ArrayList<>();
     }
 
     public Section(int id, int courseId, String sectionNumber,
                    String semester, int year, int capacity, int enrolled, int facultyId) {
-        this(id, courseId, sectionNumber, semester, year, capacity, enrolled, facultyId, null, null);
+        this(courseId, sectionNumber, semester, year, capacity, enrolled, facultyId);
+        this.id = id;
     }
 
     public Section(int courseId, String sectionNumber,
                    String semester, int year, int capacity, int enrolled, int facultyId) {
-        this(-1, courseId, sectionNumber, semester, year, capacity, enrolled, facultyId, null, null);
+        this(courseId, sectionNumber, semester, year, capacity);
+        this.enrolled = enrolled;
+        this.facultyId = facultyId;
     }
 
-    public Section(int courseId, String sectionNumber,
-                   String semester, int year, int capacity) {
-        this(-1, courseId, sectionNumber, semester, year, capacity, -1, -1, null, null);
+    public Section(int courseId, String sectionNumber, String semester, int year, int capacity) {
+        this(sectionNumber, semester, year, capacity);
+        this.courseId = courseId;
+    }
+
+    public Section(String sectionNumber, String semester, int year, int capacity) {
+        this.sectionNumber = sectionNumber;
+        this.semester = semester;
+        this.year = year;
+        this.capacity = capacity;
+        this.enrolledStudents = new ArrayList<>();
+        this.waitlist = new ArrayList<>();
     }
 
     public boolean hasCapacity() {
         return enrolled < capacity;
     }
 
-    private boolean isAlreadyEnrolled(Student newStudent) {
-        return enrolledStudents.stream().anyMatch(student -> student.getId() == newStudent.getId());
+    private boolean isAlreadyOnWaitlist(Student newStudent) {
+        try {
+            return getWaitlist().stream().anyMatch(we -> we.getStudentId() == newStudent.getId());
+        } catch (SQLException se) {
+            se.printStackTrace();
+            return true;
+        }
     }
 
-    public boolean enroll(Student newStudent) {
+    private boolean isAlreadyEnrolled(Student newStudent) {
+        try {
+            return getEnrolledStudents().stream().anyMatch(student -> student.getId() == newStudent.getId());
+        } catch (SQLException se) {
+            se.printStackTrace();
+            return true;
+        }
+    }
+
+    public int enroll(Student newStudent) {
         if (hasCapacity() && !isAlreadyEnrolled(newStudent)) {
-            // TODO: Fix upsertAll and upsert code to handle related tables and see if simply doing this with an
-            //   upsertAll works after putting newStudent in enrolledStudents.
-            //   BUT; For now, I'm manually creating a new Enrollment.
+            // TODO: Update DatabaseManager to handle generic composite object dependency updates.
             try {
+                ensureId();
                 Enrollment enrollment = new Enrollment(newStudent.getId(), this.getId());
                 DatabaseManager.getInstance().upsert(enrollment);
+                this.enrollments.add(enrollment);
                 enrolledStudents.add(newStudent);
                 enrolled++;
-                // TODO: Also need to upsertAll to this Section to save enrolled data back
-                return true;
-            } catch (SQLException e) {
-                e.printStackTrace();
-                System.out.println("Error enrolling student due to DB.");
-            } catch (IllegalAccessException e) {
-                e.printStackTrace();
-                System.out.println("Error enrolling student due to Reflection.");
+                // To make sure enrollment numbers get updated, could also make this a trigger in the database.
+                DatabaseManager.getInstance().upsert(this);
+                return enrollment.getId();
+            } catch (SQLException | IllegalAccessException e) {
+                return 0;
             }
-            return false;
         }
-        return false;
+        return 0;
     }
 
     public boolean drop(Student dropStudent) {
-        // TODO: Create Generic Delete code in DatabaseManager that allows for deleting models generically.
-        //   BUT; For now, I'm manually updating the enrollment.
         // First let's see if we can find an Enrollment for this student.
         try {
             Optional<Enrollment> optionalEnrollment = this.getEnrollments().stream()
-                    .filter(enrollment -> enrollment.getStudentId() == dropStudent.getId()).findAny();
+                    .filter(enrollment -> enrollment.getStudentId() == dropStudent.getId()).findFirst();
             if(optionalEnrollment.isPresent()) {
+                DatabaseManager dbManager = DatabaseManager.getInstance();
                 // Update the Enrollment with the DROP status
                 Enrollment enrollment = optionalEnrollment.get();
                 enrollment.setStatus("DROPPED");
                 enrollment.setDroppedAt(LocalDateTime.now());
-                DatabaseManager.getInstance().upsert(enrollment);
+                dbManager.upsert(enrollment);
                 if( enrolledStudents.removeIf(student -> student.getId() == dropStudent.getId()) ) {
+                    this.enrollments.remove(enrollment);
                     enrolled--;
+                    // To make sure enrollment numbers get updated, could also make this a trigger in the database.
+                    dbManager.upsert(this);
                     return true;
                 }
             }
@@ -142,18 +158,54 @@ public class Section {
         return false;
     }
 
-    public void addToWaitlist(int studentId) {
-        if (!waitlist.contains(studentId)) {
-            waitlist.add(studentId);
+    public int addToWaitlist(Student newStudent) {
+        if (!isAlreadyOnWaitlist(newStudent) && !isAlreadyEnrolled(newStudent)) {
+            try {
+                ensureId();
+                WaitlistEntry waitlist = new WaitlistEntry(newStudent.getId(), this.getId(), this.getNextWaitlistPosition());
+                DatabaseManager.getInstance().upsert(waitlist);
+                this.waitlist.add(waitlist);
+                return waitlist.getId();
+            } catch (SQLException | IllegalAccessException e) {
+                return 0;
+            }
         }
+        return 0;
     }
 
-    public boolean removeFromWaitlist(int studentId) {
-        return waitlist.remove(Integer.valueOf(studentId));
+    public boolean removeFromWaitlist(Student student) {
+        try {
+            // First let's see if we can find a WaitlistEntry for this student.
+            Optional<WaitlistEntry> wle = getWaitlist().stream()
+                    .filter(we -> we.getStudentId() == student.getId()).findFirst();
+            if(wle.isPresent()) {
+                DatabaseManager.getInstance().delete(wle);
+                return waitlist.remove(wle.get());
+            }
+            return true;
+        } catch (SQLException | IllegalAccessException e) { e.printStackTrace(); }
+        return false;
     }
 
-    public int getWaitlistPosition(int studentId) {
-        return waitlist.indexOf(studentId) + 1; // 1-based
+    public int getNextWaitlistPosition() throws SQLException {
+        if(this.waitlist == null || this.waitlist.isEmpty()) {
+            String sql = "SELECT count(*) FROM waitlist where section_id = ?;";
+            return DatabaseManager.getInstance().executeQuery(sql, rs -> {
+                return rs.getInt(1);
+            }, this.getId()) + 1;
+        }
+        return waitlist.size() + 1; // 1-based
+    }
+
+    public int getWaitlistPosition(Student student) throws SQLException {
+        if(this.waitlist == null || this.waitlist.isEmpty()) {
+            String sql = "SELECT position FROM waitlist where section_id = ? and student_id = ?;";
+            return DatabaseManager.getInstance().executeQuery(sql, rs -> {
+                return rs.getInt(1);
+            }, this.getId(), student.getId());
+        }
+        return waitlist.stream().filter(wl -> wl.getStudentId() == student.getId())
+                .findFirst().map(WaitlistEntry::getPosition).orElse(0);
     }
 
     // Getters
@@ -163,7 +215,14 @@ public class Section {
     public int getCapacity() { return capacity; }
     public int getEnrolled() { return enrolled; }
     public int getAvailableSeats() { return capacity - enrolled; }
-    public List<Integer> getWaitlist() { return new ArrayList<>(waitlist); }
+
+    public List<WaitlistEntry> getWaitlist() throws SQLException {
+        if (this.waitlist == null) {
+            this.waitlist = DatabaseManager.getInstance().fetchMany(
+                    WaitlistEntry.class, "section_id", this.getId());
+        }
+        return this.waitlist;
+    }
 
     public String getCourseName() {
         try {
@@ -176,8 +235,11 @@ public class Section {
     }
 
     public String getCourseCode() {
-        // TODO: Maybe link to courses-course here and pull back the course name instead of using courseId?
-        return String.valueOf(courseId) + "-" +  sectionNumber + "-" + semester + "-" + year; // 5-2-SP-26
+        try {
+            Course course = this.getCourse();
+            return course.getCode() + "-" + semester + year + "-" + sectionNumber; // CIS12-SP26-2
+        } catch (SQLException e) { }
+        return "UNKNOWN-" + semester + year + "-" + sectionNumber; // UNKNOWN-SP26-2
     }
 
     public int getCourseId() {
@@ -236,6 +298,7 @@ public class Section {
     }
 
     public void setCourse(Course course) {
+        this.courseId = course.getId();
         this.course = course;
     }
 
@@ -254,7 +317,7 @@ public class Section {
 
     public List<Enrollment> getEnrollments() throws SQLException {
         // TODO: Gotta find a way to modify the fetch calls to take additional filters since this will return
-        //   Enrollements in ANY status (i.e. DROPPED, etc.).
+        //   Enrollments in ANY status (i.e. DROPPED, etc.).
         if (this.enrollments == null) {
             // Lazy Load: Use the generic fetchMany from DatabaseManager
             this.enrollments = DatabaseManager.getInstance()
@@ -263,7 +326,35 @@ public class Section {
         return this.enrollments;
     }
 
-    public void setEnrollments(List<Enrollment> enrollments) {
+    protected void ensureId() throws SQLException, IllegalAccessException {
+        if(this.getId() == 0) {
+            // If the id is not set, we need to save this object to get an id to set on the list items.
+            DatabaseManager.getInstance().upsert(this);
+        }
+    }
+
+    public void setEnrollments(List<Enrollment> enrollments) throws SQLException, IllegalAccessException {
+        // TODO: Make the DatabaseManager even MORE generic where it can build a dependency graph of objects
+        //   and make upsert/upsertAll calls to satisfy and update ids in order, rather than coding setters like this.
+        ensureId();
+        // Now, let's add this object's id to the related list items foreign key id
+        for(Enrollment e : enrollments) { e.setSectionId(this.getId()); }
+        // Now let's upsertAll of these list items (i.e. a batch) and set as this object's related field.
+        DatabaseManager.getInstance().upsertAll(enrollments);
         this.enrollments = enrollments;
+    }
+
+    public Faculty getFaculty() throws SQLException {
+        if (this.faculty == null) {
+            // Lazy Load: Use the generic fetchOne from DatabaseManager
+            this.faculty = DatabaseManager.getInstance()
+                    .fetchOne(Faculty.class, "id", this.facultyId);
+        }
+        return (this.faculty != null) ? this.faculty : null;
+    }
+
+    public void setFaculty(Faculty faculty) {
+        this.facultyId = faculty.getId();
+        this.faculty = faculty;
     }
 }

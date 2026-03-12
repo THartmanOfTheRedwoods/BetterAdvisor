@@ -11,7 +11,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.WORKFLOW_TOKEN }}
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v6
     - name: Add to Project
       run: |
         # Set your project name
